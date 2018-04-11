@@ -25,9 +25,9 @@ boolean in_setup_mode;
 
 static const int DATABUFFER_LENGTH = 256;
 uint8_t data_buffer[DATABUFFER_LENGTH];
-int databuffer_pos;
-bool buffer_overflow;
-unsigned long databuffer_receive_time;
+volatile int databuffer_pos;
+volatile bool buffer_overflow;
+volatile unsigned long databuffer_receive_time;
 static unsigned long MINIMUM_TIME_BETWEEN_PACKETS = 1000L;
 
 
@@ -150,6 +150,40 @@ void serialEvent() {
   }
 }
 
+void handleRequest() {
+  String response = "";
+  int i;
+  for (i=0; i<databuffer_pos; i++)
+  {
+    switch(i%8)
+    {
+      case 0: if(i!=0)
+              {
+                response += "\n";
+              }
+              response += String(i, 16);
+              response += ":";
+              break;
+      case 4: response += " ";
+              break;
+      default: break;      
+    }
+    response += " ";
+    response += String(data_buffer[i], 16);
+  }
+
+  if (buffer_overflow)
+  {
+    response += "\n\n(Buffer overflowed)";
+  }
+  
+  server.send(200, F("text/plain"), response);
+}
+
+void handleNotFound() {
+  server.send(404, F("text/plain"), F("Page Not Found\n"));
+}
+
 void setup()
 {
   EEPROM.begin(1 + MAX_SSID_LENGTH + 1 + MAX_PASSWORD_LENGTH + 1);
@@ -163,7 +197,6 @@ void setup()
     dnsServer.start(DNS_PORT, "*", apIP);
 
     server.on("/", handleSetupRoot);
-    server.begin();
   }
   else
   {
@@ -184,8 +217,11 @@ void setup()
       delay(500);
     }
 
-    //TODO
+    server.on("/", handleRequest);
+    server.onNotFound(handleNotFound);
   }
+
+  server.begin();
 }
 
 void loop()
@@ -193,8 +229,7 @@ void loop()
   if (in_setup_mode) {
       dnsServer.processNextRequest();
   }
-  else
-  {
-    //TODO
-  }
+
+  server.handleClient();
+  delay(100);
 }

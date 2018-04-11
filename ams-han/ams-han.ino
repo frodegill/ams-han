@@ -7,7 +7,8 @@ static const char* SETUP_SSID = "sensor-setup";
 static const byte EEPROM_INITIALIZED_MARKER = 0xF1; //Just a magic number
 
 
-#define SETUP_MODE_PIN (D7)
+static const uint8_t SETUP_MODE_PIN = D7;
+static const uint8_t HAN_RX_PIN     = D2;
 
 ESP8266WebServer server(80);
 
@@ -21,6 +22,13 @@ IPAddress apIP(192, 168, 4, 1);
 char ssid_param[MAX_SSID_LENGTH+1];
 char password_param[MAX_PASSWORD_LENGTH+1];
 boolean in_setup_mode;
+
+static const int DATABUFFER_LENGTH = 256;
+uint8_t data_buffer[DATABUFFER_LENGTH];
+int databuffer_pos;
+bool buffer_overflow;
+unsigned long databuffer_receive_time;
+static unsigned long MINIMUM_TIME_BETWEEN_PACKETS = 1000L;
 
 
 void read_persistent_string(char* s, int max_length, int& adr)
@@ -119,6 +127,29 @@ void handleSetupRoot() {
   }
 }
 
+void serialEvent() {
+  unsigned long now = millis();
+  if (now<databuffer_receive_time || (now-databuffer_receive_time)>MINIMUM_TIME_BETWEEN_PACKETS)
+  {
+    databuffer_pos = 0;
+    buffer_overflow = false;
+    databuffer_receive_time = now;
+  }
+
+  uint8_t b;
+  while (Serial.available()) {
+    b = Serial.read();
+    if ((databuffer_pos+1)<DATABUFFER_LENGTH)
+    {
+      data_buffer[databuffer_pos++] = b;
+    }
+    else
+    {
+      buffer_overflow = true;
+    }
+  }
+}
+
 void setup()
 {
   EEPROM.begin(1 + MAX_SSID_LENGTH + 1 + MAX_PASSWORD_LENGTH + 1);
@@ -137,6 +168,13 @@ void setup()
   else
   {
     in_setup_mode = false;
+    
+    databuffer_pos = 0;
+    buffer_overflow = false;
+    databuffer_receive_time = 0L;
+
+    Serial.begin(9600, SERIAL_8N1);
+    Serial.setDebugOutput(false);
 
     read_persistent_params();
     

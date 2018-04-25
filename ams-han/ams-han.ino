@@ -6,9 +6,8 @@
 static const char* SETUP_SSID = "sensor-setup";
 static const byte EEPROM_INITIALIZED_MARKER = 0xF1; //Just a magic number
 
-
 static const uint8_t SETUP_MODE_PIN = D7;
-static const uint8_t HAN_RX_PIN     = D2;
+static const uint8_t HAN_RX_PIN     = D9;
 
 ESP8266WebServer server(80);
 
@@ -29,6 +28,16 @@ volatile int databuffer_pos;
 volatile bool buffer_overflow;
 volatile unsigned long databuffer_receive_time;
 static unsigned long MINIMUM_TIME_BETWEEN_PACKETS = 1000L;
+
+static const uint8_t SLIP_END     = 0xC0;
+static const uint8_t SLIP_ESC     = 0xDB;
+static const uint8_t SLIP_ESC_END = 0xDC;
+static const uint8_t SLIP_ESC_ESC = 0xDD;
+
+static const unsigned CRC16_XMODEM_POLY = 0x1021;
+
+static const SerialConfig SERIAL_MODE = SERIAL_8N1;
+
 
 
 void read_persistent_string(char* s, int max_length, int& adr)
@@ -139,8 +148,29 @@ void serialEvent() {
   uint8_t b;
   while (Serial.available()) {
     b = Serial.read();
-    if ((databuffer_pos+1)<DATABUFFER_LENGTH)
+    if (0==databuffer_pos && SLIP_END==b) //FRAME_END can be sent to force reset of buffer
     {
+      continue;
+    }
+    
+    if ((databuffer_pos+1) < DATABUFFER_LENGTH) //Room for one more byte?
+    {
+      //ESC ESC_END => END  (0xDB 0xDC => 0xC0)
+      //ESC ESC_ESC => ESC  (0xDB 0xDD => 0xDB)
+      if (databuffer_pos>0 && SLIP_ESC==data_buffer[databuffer_pos-1])
+      {
+        if (SLIP_ESC_END==b)
+        {
+          data_buffer[databuffer_pos-1] = SLIP_END;
+          continue;
+        }
+        else if (SLIP_ESC_ESC==b)
+        {
+          //data_buffer[databuffer_pos-1] = SLIP_ESC; //Already has this value
+          continue;
+        }
+      }
+
       data_buffer[databuffer_pos++] = b;
     }
     else
@@ -150,33 +180,147 @@ void serialEvent() {
   }
 }
 
-void handleRequest() {
-  String response = "";
-  int i;
-  for (i=0; i<databuffer_pos; i++)
+char* toHex(char* buffer, unsigned int value)
+{
+  buffer[0]='0';
+  buffer[1]='x';
+  uint8_t length = value<256?2:4;
+  for (uint8_t i=length; i>0; i--)
   {
-    switch(i%8)
-    {
-      case 0: if(i!=0)
-              {
-                response += "\n";
-              }
-              response += String(i, 16);
-              response += ":";
-              break;
-      case 4: response += " ";
-              break;
-      default: break;      
-    }
-    response += " ";
-    response += String(data_buffer[i], 16);
+    buffer[i+1] = ((value&0x000F)<=9?'0':'A'-10)+(value&0x000F);
+    value = value >> 4;
   }
+  buffer[length+2] = 0;
+  return buffer;
+}
+
+void dumpHex(const uint8_t* data_buffer, int databuffer_pos, String& response, uint8_t start_pos, uint8_t length)
+{
+  char tmp_buffer[7];
+  if(start_pos!=0)
+  {
+    response += "\n";
+  }
+  response.concat(toHex(tmp_buffer, start_pos));
+  response += ":";
+  for (int i=0; i<length && (start_pos+i)<databuffer_pos; i++)
+  {
+    response += " ";
+    response.concat(toHex(tmp_buffer, data_buffer[start_pos+i]));
+  }
+}
+
+unsigned int hexToInt(const uint8_t* data_buffer, int databuffer_pos, uint8_t start_pos)
+{
+  return ((start_pos+4)>databuffer_pos) ? 0 : data_buffer[start_pos+3]<<24 | data_buffer[start_pos+2]<<16 | data_buffer[start_pos+1]<<8 | data_buffer[start_pos];
+}
+
+unsigned short hexToShort(const uint8_t* data_buffer, int databuffer_pos, uint8_t start_pos)
+{
+  return ((start_pos+2)>databuffer_pos) ? 0 : data_buffer[start_pos+1]<<8 | data_buffer[start_pos];
+}
+
+boolean validCrc16(const uint8_t* data_buffer, int databuffer_pos, uint8_t content_start_pos, uint8_t content_length, uint8_t crc_start_pos)
+{
+  if ((content_start_pos+content_length)>databuffer_pos || (crc_start_pos+2)>databuffer_pos)
+  {
+    return false;
+  }
+  
+  unsigned crc = 0;
+  for (uint8_t i=0; i<content_length; i++)
+  {
+      crc ^= ((unsigned)data_buffer[content_start_pos+i]) << 8;
+      for (uint8_t j=0; j<8; j++)
+      {
+        crc = crc&0x8000 ? (crc<<1)^CRC16_XMODEM_POLY : crc<<1;
+      }
+  }
+  unsigned short actual_crc = hexToShort(data_buffer, databuffer_pos, crc_start_pos);
+  return crc==actual_crc;
+}
+
+void handleRequest() {
+
+  String response;
+  dumpHex(data_buffer, databuffer_pos, response,  0, 16);
+  response.concat(F("\tMålernummer: \""));
+  for (uint8_t i=0; i<16; i++)
+  {
+    response.concat((char)data_buffer[i]);
+  }
+  response.concat(F("\""));
+
+  dumpHex(data_buffer, databuffer_pos, response, 16,  4);
+  response.concat(F("\tAkkumulert forbruk: "));
+  response.concat(hexToInt(data_buffer, databuffer_pos, 16)/1000.0);
+  response.concat(F("MWh"));
+ 
+  dumpHex(data_buffer, databuffer_pos, response, 20, 28);
+  
+  dumpHex(data_buffer, databuffer_pos, response, 48,  4);
+  response.concat(F("\tForbruk: "));
+  response.concat(hexToInt(data_buffer, databuffer_pos, 48));
+  response.concat(F("W"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 52, 12);
+
+  dumpHex(data_buffer, databuffer_pos, response, 64,  2);
+  response.concat(F("\tStrøm fase 1: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 64));
+  response.concat(F("mA"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 66,  4);
+
+  dumpHex(data_buffer, databuffer_pos, response, 70,  2);
+  response.concat(F("\tStrøm fase 2: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 70));
+  response.concat(F("mA"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 72,  6);
+
+  dumpHex(data_buffer, databuffer_pos, response, 78,  2);
+  response.concat(F("\tStrøm fase 3: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 78));
+  response.concat(F("mA"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 80,  2);
+
+  dumpHex(data_buffer, databuffer_pos, response, 82,  2);
+  response.concat(F("\tSpenning fase 1: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 82)/10.0);
+  response.concat(F("V"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 84,  2);
+  response.concat(F("\tSpenning fase 2: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 84)/10.0);
+  response.concat(F("V"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 86,  2);
+  response.concat(F("\tSpenning fase 3: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 86)/10.0);
+  response.concat(F("V"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 88,  6);
+
+  dumpHex(data_buffer, databuffer_pos, response, 94,  2);
+  response.concat(F("\tFrekvens: "));
+  response.concat(hexToShort(data_buffer, databuffer_pos, 94)/100.0);
+  response.concat(F("Hz"));
+
+  dumpHex(data_buffer, databuffer_pos, response, 96,  1);
+
+  dumpHex(data_buffer, databuffer_pos, response, 97,  2);
+  response.concat(F("\tSjekksum er "));
+  response.concat(validCrc16(data_buffer, databuffer_pos, 0, 97, 97) ? F("OK") : F("IKKE OK"));
+  
+  dumpHex(data_buffer, databuffer_pos, response, 99,  1);
 
   if (buffer_overflow)
   {
-    response += "\n\n(Buffer overflowed)";
+    response.concat(F("\n\n(Buffer overflowed)"));
   }
-  
+
   server.send(200, F("text/plain"), response);
 }
 
@@ -206,7 +350,7 @@ void setup()
     buffer_overflow = false;
     databuffer_receive_time = 0L;
 
-    Serial.begin(9600, SERIAL_8N1);
+    Serial.begin(9600, SERIAL_MODE);
     Serial.setDebugOutput(false);
 
     read_persistent_params();
@@ -231,5 +375,11 @@ void loop()
   }
 
   server.handleClient();
+
+  if (Serial.available())
+  {
+    serialEvent();
+  }
+  
   delay(100);
 }

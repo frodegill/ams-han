@@ -7,7 +7,7 @@ static const char* SETUP_SSID = "sensor-setup";
 static const byte EEPROM_INITIALIZED_MARKER = 0xF1; //Just a magic number
 
 static const uint8_t SETUP_MODE_PIN = D7;
-static const uint8_t HAN_RX_PIN     = D9;
+static const uint8_t HAN_RX_PIN     = 3; //RX for Serial. Seems to be GPIO3 on most boards
 
 ESP8266WebServer server(80);
 
@@ -69,7 +69,7 @@ void read_persistent_params()
 
 void write_persistent_string(const char* s, size_t max_length, int& adr)
 {
-  for (int i=0; i<min(strlen(s), max_length); i++)
+  for (int i=0; i<std::min(strlen(s), max_length); i++)
   {
     EEPROM.write(adr++, s[i]);
   }
